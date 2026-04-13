@@ -2,12 +2,23 @@ import os
 import msal
 import pathlib as pl
 from typing import NamedTuple
+from contextvars import ContextVar
 from dotenv import load_dotenv
 
 load_dotenv()
 
 CACHE_FILE = pl.Path.home() / ".microsoft_mcp_token_cache.json"
 SCOPES = ["https://graph.microsoft.com/.default"]
+
+# External bearer mode: when set via middleware, get_token() returns this
+# instead of using MSAL. Used when deployed as a remote MCP server with
+# Anthropic's vault forwarding Microsoft access tokens as bearer.
+_external_bearer: ContextVar[str | None] = ContextVar("external_bearer", default=None)
+
+
+def set_external_bearer(token: str) -> None:
+    """Set the bearer token for the current request context."""
+    _external_bearer.set(token)
 
 
 class Account(NamedTuple):
@@ -48,6 +59,12 @@ def get_app() -> msal.PublicClientApplication:
 
 
 def get_token(account_id: str | None = None) -> str:
+    # External bearer mode: return the token from the HTTP request.
+    bearer = _external_bearer.get()
+    if bearer:
+        return bearer
+
+    # Original MSAL flow (for local/stdio mode)
     app = get_app()
 
     accounts = app.get_accounts()
@@ -90,6 +107,10 @@ def get_token(account_id: str | None = None) -> str:
 
 
 def list_accounts() -> list[Account]:
+    # In external bearer mode, no MSAL cache — return placeholder
+    if _external_bearer.get():
+        return [Account(username="external", account_id="external")]
+
     app = get_app()
     return [
         Account(username=a["username"], account_id=a["home_account_id"])
@@ -99,6 +120,9 @@ def list_accounts() -> list[Account]:
 
 def authenticate_new_account() -> Account | None:
     """Authenticate a new account interactively"""
+    if _external_bearer.get():
+        return Account(username="external", account_id="external")
+
     app = get_app()
 
     flow = app.initiate_device_flow(scopes=SCOPES)
@@ -126,10 +150,8 @@ def authenticate_new_account() -> Account | None:
     if isinstance(cache, msal.SerializableTokenCache) and cache.has_state_changed:
         _write_cache(cache.serialize())
 
-    # Get the newly added account
     accounts = app.get_accounts()
     if accounts:
-        # Find the account that matches the token we just got
         for account in accounts:
             if (
                 account.get("username", "").lower()
@@ -140,7 +162,6 @@ def authenticate_new_account() -> Account | None:
                 return Account(
                     username=account["username"], account_id=account["home_account_id"]
                 )
-        # If exact match not found, return the last account
         account = accounts[-1]
         return Account(
             username=account["username"], account_id=account["home_account_id"]
